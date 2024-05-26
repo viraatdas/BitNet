@@ -3,55 +3,26 @@ from torch import nn
 from torch.nn.parameter import Parameter
 import torch.nn.functional as F
 from typing import Callable, Optional
-from fairscale.nn.model_parallel.layers import (
-    ColumnParallelLinear)
-
+from fairscale.nn.model_parallel.layers import ColumnParallelLinear
 
 def get_model_parallel_world_size():
-    # Dummy function: replace with actual model parallel world size fetching
-    return torch.distributed.get_world_size()
+    # Placeholder for the actual function to fetch the model parallel world size
+    return torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
 def divide_and_check_no_remainder(value, divisor):
-    assert value % divisor == 0
+    assert value % divisor == 0, "Value must be divisible by the divisor with no remainder."
     return value // divisor
 
-def init_weights(weight_tensor):
-    # for binarized networks should we use something other than Xavier method?
-    nn.init.xavier_normal_(weight_tensor)
+def init_weights(weight_tensor, binarization=True):
+    # Adjust initialization method if using binarization
+    if binarization:
+        # Use a uniform distribution for initialization, suitable for binarized weights
+        nn.init.uniform_(weight_tensor, -1, 1)
+    else:
+        # Standard Xavier initialization for non-binarized networks
+        nn.init.xavier_normal_(weight_tensor)
 
 class BitColumnParallelLinear(nn.Module):
-    """
-    Implements a linear layer with column parallelism and binarization of weights, suitable for use in large-scale 
-    distributed training environments. This layer is designed to integrate with models that employ bit quantization techniques,
-    such as 1-bit representations of weights.
-
-    This linear layer is defined by the operation Y = XA + b, where A is the weight matrix. The layer distributes the weight
-    matrix A across multiple GPUs along its second dimension. Specifically, A is split into [A_1, ..., A_p], where p is the 
-    number of model parallel partitions. This class modifies the standard column parallelism by applying binarization to 
-    the weights during the forward pass, effectively using sign-based quantization to reduce memory footprint and potentially
-    accelerate computation.
-
-    Attributes:
-        in_features (int): The number of input features (the first dimension of the weight matrix A).
-        out_features (int): The total number of output features (the second dimension of the weight matrix A).
-        bias (bool): If True, includes a bias term in the computation (default: True).
-        gather_output (bool): If True, gathers outputs from all partitions at the end of the forward pass so that each 
-                              output element Y is available to all GPUs. If False, each GPU produces only a portion of the 
-                              output Y_i = XA_i (default: True).
-
-    Parameters:
-        in_features (int): Number of input features.
-        out_features (int): Number of output features.
-        bias (bool, optional): If set to True, the layer will include a bias term. Default: True.
-        gather_output (bool, optional): Determines whether to gather output from all model partitions. Default: True.
-
-    Example:
-        # Assuming a model parallel environment is properly set up
-        layer = BitColumnParallelLinear(1024, 2048, bias=True, gather_output=False)
-        input_tensor = torch.randn(10, 1024)  # Example input
-        output_tensor = layer(input_tensor)  # Forward pass
-        print(output_tensor.shape)  # Output shape will depend on the number of partitions and gather_output setting
-    """
     def __init__(self, in_features, out_features, bias=True, gather_output=True):
         super(BitColumnParallelLinear, self).__init__()
         self.in_features = in_features
@@ -60,7 +31,6 @@ class BitColumnParallelLinear(nn.Module):
         world_size = get_model_parallel_world_size()
         self.output_size_per_partition = divide_and_check_no_remainder(out_features, world_size)
 
-        # Parameters
         self.weight = Parameter(torch.Tensor(self.output_size_per_partition, in_features))
         if bias:
             self.bias = Parameter(torch.Tensor(self.output_size_per_partition))
@@ -68,7 +38,6 @@ class BitColumnParallelLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
 
-        # Initialize weights
         init_weights(self.weight)
 
     def forward(self, input):
@@ -86,44 +55,48 @@ class BitColumnParallelLinear(nn.Module):
 
         return output
 
-# Additional functions needed for model parallel utilities
+class BitRowParallelLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, input_is_parallel=False):
+        super(BitRowParallelLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.input_is_parallel = input_is_parallel
+        world_size = get_model_parallel_world_size()
+        self.input_size_per_partition = divide_and_check_no_remainder(in_features, world_size)
+
+        self.weight = Parameter(torch.Tensor(out_features, self.input_size_per_partition))
+        if bias:
+            self.bias = Parameter(torch.Tensor(out_features))
+            self.bias.zero_()
+        else:
+            self.register_parameter('bias', None)
+
+        init_weights(self.weight)
+
+    def forward(self, input_):
+        if not self.input_is_parallel:
+            input_parallel = scatter_to_model_parallel_region(input_)
+        else:
+            input_parallel = input_
+        
+        # Binarize weights before computation
+        binarized_weight = torch.sign(self.weight)
+
+        # Perform the linear operation
+        output_parallel = F.linear(input_parallel, binarized_weight, self.bias)
+
+        # Gather or reduce output across model parallel regions
+        output = gather_from_model_parallel_region(output_parallel)
+        return output
+
 def copy_to_model_parallel_region(input_tensor):
-    # This function would handle copying tensors to the correct GPU
-    # For simplicity, we'll assume it returns the tensor as-is
+    # Placeholder function; in practice, replace with appropriate tensor distribution code
+    return input_tensor
+
+def scatter_to_model_parallel_region(input_tensor):
+    # Placeholder function; in practice, replace with appropriate tensor distribution code
     return input_tensor
 
 def gather_from_model_parallel_region(output_tensor):
-    # This function would handle gathering tensors from all parallel GPUs
-    # For simplicity, we'll assume it returns the tensor as-is
+    # Placeholder function; in practice, replace with appropriate tensor collection code
     return output_tensor
-
-class BitRowParallelLinear(nn.Module):
-      """Linear layer with row parallelism.
-
-    The linear layer is defined as Y = XA + b. A is parallelized along
-    its first dimension and X along its second dimension as:
-               -   -
-              | A_1 |
-              | .   |
-          A = | .   |        X = [X_1, ..., X_p]
-              | .   |
-              | A_p |
-               -   -
-    Arguments:
-        in_features: first dimension of matrix A.
-        out_features: second dimension of matrix A.
-        bias: If true, add bias. Note that bias is not parallelized.
-        input_is_parallel: If true, we assume that the input is already
-                           split across the GPUs and we do not split
-                           again.
-        init_method: method to initialize weights. Note that bias is always set
-                     to zero.
-        stride: For the strided linear layers.
-        keep_master_weight_for_test: This was added for testing and should be
-                                     set to False. It returns the master weights
-                                     used for initialization.
-    """
-      def __init__():
-          pass
-
-
